@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phát hiện vật thể</title>
+<meta name="description" content="Gửi ảnh lên API YOLO26n trên Modal và xem các vật được phát hiện.">
+<style>
+  :root {
+    --bg: #f6f7f9; --surface: #ffffff; --text: #14171c; --muted: #5d6673;
+    --border: #dde1e7; --accent: #2563eb; --accent-text: #ffffff;
+    --ok: #15803d; --err: #b91c1c; --radius: 12px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1115; --surface: #171a21; --text: #e7eaf0; --muted: #98a2b3;
+      --border: #2a2f3a; --accent: #4f8bff; --accent-text: #0b1020;
+      --ok: #4ade80; --err: #f87171;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1115; --surface: #171a21; --text: #e7eaf0; --muted: #98a2b3;
+    --border: #2a2f3a; --accent: #4f8bff; --accent-text: #0b1020;
+    --ok: #4ade80; --err: #f87171;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }  /* để rule display bên dưới không đè thuộc tính hidden */
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .grid { display: grid; grid-template-columns: 1fr 300px; gap: 16px; }
+  @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 16px;
+  }
+  .drop {
+    border: 2px dashed var(--border); border-radius: var(--radius);
+    min-height: 260px; display: grid; place-items: center; text-align: center;
+    color: var(--muted); cursor: pointer; position: relative; overflow: hidden;
+  }
+  .drop.over { border-color: var(--accent); color: var(--text); }
+  .drop canvas, .drop video { max-width: 100%; display: block; border-radius: 8px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  button {
+    font: inherit; border-radius: 8px; padding: 8px 14px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  label.field { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 4px; }
+  input[type="text"] {
+    width: 100%; font: 13px ui-monospace, Menlo, monospace; padding: 8px;
+    border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text);
+  }
+  input[type="range"] { width: 100%; }
+  .status { font-size: 14px; margin-top: 12px; min-height: 22px; }
+  .status.ok { color: var(--ok); } .status.err { color: var(--err); }
+  ul.objects { list-style: none; padding: 0; margin: 8px 0 0; }
+  ul.objects li {
+    display: flex; justify-content: space-between; gap: 8px;
+    padding: 6px 0; border-bottom: 1px solid var(--border);
+  }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 8px; }
+  .muted { color: var(--muted); font-size: 13px; }
+  h2 { font-size: 15px; margin: 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Phát hiện vật thể</h1>
+  <p class="sub">Gửi ảnh lên API YOLO26n đang chạy trên Modal và xem các vật được nhận ra.</p>
+
+  <div class="grid">
+    <section class="card">
+      <div class="drop" id="drop" tabindex="0" role="button" aria-label="Chọn hoặc thả ảnh">
+        <div id="placeholder">Bấm để chọn ảnh, hoặc kéo thả ảnh vào đây</div>
+        <canvas id="canvas" hidden></canvas>
+        <video id="video" playsinline muted hidden></video>
+      </div>
+      <input type="file" id="file" accept="image/*" hidden>
+      <div class="actions">
+        <button id="pick">Chọn ảnh</button>
+        <button id="camera">Mở camera</button>
+        <button id="snap" class="primary" hidden>Chụp và gửi</button>
+      </div>
+      <div class="status" id="status" aria-live="polite"></div>
+    </section>
+
+    <aside class="card">
+      <h2>Kết quả</h2>
+      <p class="muted" id="summary">Chưa có ảnh nào được gửi.</p>
+      <label class="field" for="threshold">Ngưỡng tin cậy: <strong id="thVal">0.25</strong></label>
+      <input type="range" id="threshold" min="0.25" max="0.95" step="0.05" value="0.25">
+      <ul class="objects" id="list"></ul>
+      <label class="field" for="api">API endpoint</label>
+      <input type="text" id="api" spellcheck="false"
+             value="https://toxingau1000--phan-loai-detector-detect.us-east.modal.run">
+      <p class="muted">Lần gọi đầu sau khi máy chủ nghỉ có thể mất 5–10 giây để khởi động.</p>
+    </aside>
+  </div>
+</main>
+
+<script>
+const MAX_SIDE = 640;          // giống ảnh VGA của ESP32-CAM, giữ ảnh dưới giới hạn 500 KB của API
+const JPEG_QUALITY = 0.85;
+const TIMEOUT_MS = 30000;      // đủ cho cold start
+
+const $ = (id) => document.getElementById(id);
+const canvas = $("canvas"), ctx = canvas.getContext("2d"), video = $("video");
+let currentImage = null;       // ảnh (đã thu nhỏ) đang hiển thị
+let lastObjects = [];
+let stream = null;
+
+// Mỗi nhãn một màu cố định, suy ra từ tên nhãn
+function colorFor(label) {
+  let hash = 0;
+  for (const ch of label) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
+  return `hsl(${hash % 360} 85% 50%)`;
+}
+
+function setStatus(text, kind = "") {
+  $("status").textContent = text;
+  $("status").className = "status " + kind;
+}
+
+// Thu ảnh về tối đa 640px rồi trả về {bitmap, blob}
+async function shrink(source) {
+  const w = source.videoWidth || source.width, h = source.videoHeight || source.height;
+  const scale = Math.min(1, MAX_SIDE / Math.max(w, h));
+  const off = document.createElement("canvas");
+  off.width = Math.round(w * scale);
+  off.height = Math.round(h * scale);
+  off.getContext("2d").drawImage(source, 0, 0, off.width, off.height);
+  const blob = await new Promise((ok) => off.toBlob(ok, "image/jpeg", JPEG_QUALITY));
+  return { bitmap: off, blob };
+}
+</script>
+<script>
+function draw() {
+  if (!currentImage) return;
+  canvas.width = currentImage.width;
+  canvas.height = currentImage.height;
+  ctx.drawImage(currentImage, 0, 0);
+  const th = parseFloat($("threshold").value);
+  const shown = lastObjects.filter((o) => o.conf >= th);
+  const line = Math.max(2, Math.round(canvas.width / 240));
+  ctx.font = `${Math.max(12, Math.round(canvas.width / 40))}px system-ui, sans-serif`;
+  for (const o of shown) {
+    const [x1, y1, x2, y2] = o.box;
+    const color = colorFor(o.label);
+    ctx.strokeStyle = color; ctx.lineWidth = line;
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    const text = `${o.label} ${(o.conf * 100).toFixed(0)}%`;
+    const tw = ctx.measureText(text).width + 8, th2 = parseInt(ctx.font) + 6;
+    const ty = y1 - th2 < 0 ? y1 : y1 - th2;   // nhãn nằm trong khung nếu sát mép trên
+    ctx.fillStyle = color; ctx.fillRect(x1, ty, tw, th2);
+    ctx.fillStyle = "#000"; ctx.fillText(text, x1 + 4, ty + th2 - 6);
+  }
+  renderList(shown);
+}
+
+function renderList(shown) {
+  const list = $("list");
+  list.replaceChildren();
+  for (const o of shown) {
+    const li = document.createElement("li");
+    const name = document.createElement("span");
+    const sw = document.createElement("span");
+    sw.className = "swatch"; sw.style.background = colorFor(o.label);
+    name.append(sw, o.label);
+    const conf = document.createElement("span");
+    conf.textContent = (o.conf * 100).toFixed(1) + "%";
+    li.append(name, conf);
+    list.append(li);
+  }
+  $("summary").textContent = shown.length
+    ? `${shown.length} vật (trong tổng ${lastObjects.length})`
+    : "Không có vật nào vượt ngưỡng.";
+}
+</script>
+<script>
+async function detect(blob) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const started = performance.now();
+  setStatus(`Đang gửi ${(blob.size / 1024).toFixed(0)} KB…`);
+  try {
+    const res = await fetch($("api").value.trim(), {
+      method: "POST",
+      headers: { "Content-Type": "image/jpeg" },
+      body: blob,
+      signal: controller.signal,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    lastObjects = data.objects || [];
+    draw();
+    setStatus(`Xong sau ${((performance.now() - started) / 1000).toFixed(1)} giây`, "ok");
+  } catch (err) {
+    lastObjects = [];
+    draw();
+    // fetch báo TypeError khi không kết nối được (sai URL, mất mạng, bị chặn CORS)
+    const msg = err.name === "AbortError" ? "Quá thời gian chờ, thử lại sau vài giây"
+      : err.name === "TypeError" ? "Không kết nối được tới API, kiểm tra URL hoặc mạng"
+      : err.message;
+    setStatus("Lỗi: " + msg, "err");
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function handleFile(file) {
+  if (!file || !file.type.startsWith("image/")) return setStatus("Hãy chọn một file ảnh", "err");
+  stopCamera();
+  try {
+    const bmp = await createImageBitmap(file);
+    const { bitmap, blob } = await shrink(bmp);
+    showImage(bitmap);
+    await detect(blob);
+  } catch {
+    setStatus("Không đọc được ảnh này", "err");
+  }
+}
+
+function showImage(bitmap) {
+  currentImage = bitmap;
+  lastObjects = [];
+  $("placeholder").hidden = true;
+  video.hidden = true;
+  canvas.hidden = false;
+  draw();
+}
+</script>
+<script>
+async function startCamera() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment", width: { ideal: 640 } }, audio: false,
+    });
+  } catch {
+    return setStatus("Không mở được camera (cần HTTPS và quyền truy cập)", "err");
+  }
+  video.srcObject = stream;
+  await video.play();
+  $("placeholder").hidden = true;
+  canvas.hidden = true;
+  video.hidden = false;
+  $("snap").hidden = false;
+  $("camera").textContent = "Tắt camera";
+  setStatus("");
+}
+
+function stopCamera() {
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = null;
+  video.hidden = true;
+  $("snap").hidden = true;
+  $("camera").textContent = "Mở camera";
+}
+
+$("pick").onclick = () => $("file").click();
+$("drop").onclick = () => { if (!stream) $("file").click(); };
+$("drop").onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") $("file").click(); };
+$("file").onchange = (e) => handleFile(e.target.files[0]);
+$("camera").onclick = () => (stream ? stopCamera() : startCamera());
+$("snap").onclick = async () => {
+  const { bitmap, blob } = await shrink(video);
+  stopCamera();
+  showImage(bitmap);
+  await detect(blob);
+};
+$("threshold").oninput = (e) => { $("thVal").textContent = (+e.target.value).toFixed(2); draw(); };
+
+const drop = $("drop");
+["dragenter", "dragover"].forEach((ev) =>
+  drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach((ev) =>
+  drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", (e) => handleFile(e.dataTransfer.files[0]));
+</script>
+</body>
+</html>
