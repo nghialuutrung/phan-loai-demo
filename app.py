@@ -16,6 +16,7 @@ APP_NAME = "smart-bin-api"
 MODEL_DIR = "/models"
 MODEL_VERSION = "aware-bin-v4-yolo26n-onnx-fp32"  # model phân loại rác v4, 7 nhãn
 MAX_BYTES = 500_000  # ảnh ESP32-CAM ở VGA thường nhỏ hơn nhiều
+MAX_STORE_BYTES = 5_000_000  # ảnh lỗi "quá lớn" vẫn lưu để tìm lỗi camera, nhưng chặn file quá khổ
 IMG_SIZE = 640  # model được export với imgsz=640
 CONF_THRESHOLD = 0.25  # server trả mọi vật từ 0,25; ESP32 tự áp ngưỡng chặt hơn từ /config
 
@@ -41,8 +42,11 @@ TIMEZONE = "Asia/Ho_Chi_Minh"
 #   smart-bin-auth : BIN_TOKEN               -> /detect và /config đòi header X-Bin-Token
 #   smart-bin-r2   : R2_ENDPOINT, R2_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 REQUIRE_TOKEN = True
-STORE_SAMPLES = False
-SAMPLE_PREFIX = "samples"  # ảnh lưu ở R2: samples/YYYY-MM-DD/<request_id>.jpg + .json
+STORE_SAMPLES = True
+# Ảnh lưu ở R2 theo ngày -> nhãn -> giờ để web admin duyệt theo ngày, lọc theo nhãn:
+#   samples/2026-11-07/plastic_bottle/143205_<request_id>.jpg + .json   (không thấy vật: nhãn "none")
+SAMPLE_PREFIX = "samples"
+VN_OFFSET_HOURS = 7  # Việt Nam UTC+7 quanh năm, không đổi giờ mùa hè; máy chủ Modal chạy giờ UTC
 
 image = modal.Image.debian_slim(python_version="3.12").pip_install(
     "onnxruntime", "pillow", "numpy", "fastapi[standard]"
@@ -61,11 +65,13 @@ with image.imports():
     import os
     import time
     import uuid
+    from datetime import datetime, timedelta, timezone
 
     import numpy as np
     import onnxruntime as ort
-    from fastapi import FastAPI, HTTPException, Request
+    from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
     from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import JSONResponse
     from PIL import Image
 
 
@@ -80,10 +86,16 @@ def store_sample(jpeg: bytes, record: dict) -> None:
     import boto3  # R2 tương thích S3 nên dùng boto3, chỉ trỏ endpoint_url về R2
 
     s3 = boto3.client("s3", endpoint_url=os.environ["R2_ENDPOINT"], region_name="auto")
-    key = f"{SAMPLE_PREFIX}/{record['date']}/{record['request_id']}"
+    # Request lỗi (ảnh hỏng, quá lớn, model lỗi) vào thư mục "error"; không thấy vật vào "none"
+    label = "error" if record.get("error") else (record["top_label"] or "none")
+    hhmmss = record["time"].replace(":", "")
+    key = f"{SAMPLE_PREFIX}/{record['date']}/{label}/{hhmmss}_{record['request_id']}"
     bucket = os.environ["R2_BUCKET"]
-    s3.put_object(Bucket=bucket, Key=f"{key}.jpg", Body=jpeg, ContentType="image/jpeg")
-    s3.put_object(Bucket=bucket, Key=f"{key}.json", Body=_json.dumps(record).encode(),
+    # Metadata đi kèm file ảnh: web admin đọc được nhãn, độ tin cậy mà không cần mở file .json
+    meta = {"label": label, "conf": str(record["top_conf"]), "model": record["model"],
+            "status": str(record["status"])}
+    s3.put_object(Bucket=bucket, Key=f"{key}.jpg", Body=jpeg, ContentType="image/jpeg", Metadata=meta)
+    s3.put_object(Bucket=bucket, Key=f"{key}.json", Body=_json.dumps(record, ensure_ascii=False).encode(),
                   ContentType="application/json")
 
 
@@ -155,41 +167,58 @@ class Detector:
             return {"model": MODEL_VERSION, "labels": self.names, **BIN_CONFIG}
 
         @web.post("/detect")
-        async def detect(request: Request):
+        async def detect(request: Request, background: BackgroundTasks):
             t0 = time.perf_counter()
+            # Sai token -> 401 và KHÔNG lưu, để người lạ không đổ rác vào bucket được
             self.check_token(request)
             body = await request.body()
             t_recv = time.perf_counter()  # nhận xong ảnh qua mạng
+            now_vn = datetime.now(timezone(timedelta(hours=VN_OFFSET_HOURS)))
+            # Trace log: 1 dòng JSON mỗi request, xem bằng `modal app logs smart-bin-api`
+            trace = {
+                "event": "detect", "request_id": uuid.uuid4().hex[:12], "model": MODEL_VERSION,
+                "device": request.headers.get("x-device-id", ""), "bytes": len(body),
+                "date": now_vn.strftime("%Y-%m-%d"), "time": now_vn.strftime("%H:%M:%S"),
+                "recv_ms": round((t_recv - t0) * 1000, 1), "top_label": None, "top_conf": 0.0,
+            }
+
+            def finish(status: int, payload: dict) -> JSONResponse:
+                # Mọi kết quả (thành công hay lỗi) đi qua đây: ghi log, lưu ảnh, trả phản hồi.
+                # Phải TRẢ VỀ response chứ không raise HTTPException, vì raise sẽ bỏ qua background task
+                trace["status"] = status
+                if STORE_SAMPLES and body and len(body) <= MAX_STORE_BYTES:
+                    # Chạy SAU khi đã gửi phản hồi cho ESP32: riêng việc giao ảnh cho hàm nền mất 0,3–1,8 s
+                    background.add_task(store_sample.spawn.aio, body, trace)
+                trace["server_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+                print(json.dumps({k: v for k, v in trace.items() if k != "objects"}, ensure_ascii=False))
+                return JSONResponse(payload, status_code=status, background=background)
+
+            def fail(status: int, error: str) -> JSONResponse:
+                trace["error"] = error
+                return finish(status, {"detail": error, "request_id": trace["request_id"]})
+
             if not body or len(body) > MAX_BYTES:
-                raise HTTPException(400, "Image is empty or too large")
+                return fail(400, "Image is empty or too large")
             try:
                 img = Image.open(io.BytesIO(body)).convert("RGB")
             except Exception:
-                raise HTTPException(400, "Cannot decode JPEG image")
+                return fail(400, "Cannot decode JPEG image")
             t1 = time.perf_counter()
-            # Chạy model trong thread riêng để không chặn các request khác đang chờ
-            objects = await asyncio.to_thread(self.infer, img)
+            try:
+                # Chạy model trong thread riêng để không chặn các request khác đang chờ
+                objects = await asyncio.to_thread(self.infer, img)
+            except Exception as err:
+                return fail(500, f"Inference failed: {type(err).__name__}")
             t2 = time.perf_counter()
 
-            request_id = uuid.uuid4().hex[:12]
-            infer_ms = round((t2 - t1) * 1000, 1)
             top = objects[0] if objects else {"label": None, "conf": 0.0}
-            # Trace log: 1 dòng JSON mỗi request, xem bằng `modal app logs smart-bin-api`
-            trace = {
-                "event": "detect", "request_id": request_id, "model": MODEL_VERSION,
-                "device": request.headers.get("x-device-id", ""), "bytes": len(body),
-                "image_size": list(img.size), "recv_ms": round((t_recv - t0) * 1000, 1),
-                "decode_ms": round((t1 - t_recv) * 1000, 1),
-                "infer_ms": infer_ms, "count": len(objects),
-                "top_label": top["label"], "top_conf": top["conf"],
-                "date": time.strftime("%Y-%m-%d"), "objects": objects,
-            }
-            if STORE_SAMPLES:
-                await store_sample.spawn.aio(body, trace)  # không chờ upload xong
-            trace["server_ms"] = round((time.perf_counter() - t0) * 1000, 1)
-            print(json.dumps({k: v for k, v in trace.items() if k != "objects"}, ensure_ascii=False))
-            return {"model": MODEL_VERSION, "request_id": request_id, "infer_ms": infer_ms,
-                    "count": len(objects), "objects": objects, "image_size": list(img.size)}
+            infer_ms = round((t2 - t1) * 1000, 1)
+            trace.update(image_size=list(img.size), decode_ms=round((t1 - t_recv) * 1000, 1),
+                         infer_ms=infer_ms, count=len(objects), top_label=top["label"],
+                         top_conf=top["conf"], objects=objects)
+            return finish(200, {"model": MODEL_VERSION, "request_id": trace["request_id"],
+                                "infer_ms": infer_ms, "count": len(objects), "objects": objects,
+                                "image_size": list(img.size)})
 
         return web
 
