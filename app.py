@@ -5,14 +5,14 @@ Một địa chỉ duy nhất, 3 đường (cùng host nên ESP32 giữ được
 - GET  /health  : kiểm tra sống, không chạy model; ESP32 gọi để mở kết nối sẵn và giữ ấm
 - GET  /config  : bảng nhãn -> ngăn để ESP32 tự quyết định đổ vào ngăn nào
 
-Model phải có sẵn trong Volume `phan-loai-models`: file .onnx và file record .json cùng tên,
+Model phải có sẵn trong Volume `smart-bin-models`: file .onnx và file record .json cùng tên,
 lấy từ thư mục models/ của repo aware và upload bằng `modal volume put`.
 """
 from __future__ import annotations
 
 import modal
 
-APP_NAME = "phan-loai"
+APP_NAME = "smart-bin-api"
 MODEL_DIR = "/models"
 MODEL_VERSION = "aware-bin-v4-yolo26n-onnx-fp32"  # model phân loại rác v4, 7 nhãn
 MAX_BYTES = 500_000  # ảnh ESP32-CAM ở VGA thường nhỏ hơn nhiều
@@ -21,8 +21,9 @@ CONF_THRESHOLD = 0.25  # server trả mọi vật từ 0,25; ESP32 tự áp ngư
 
 # Bảng ghép nhãn -> ngăn, ESP32 tải qua /config. Bảng TẠM, chưa chốt (ngăn 3 chưa có nhãn nào)
 BIN_CONFIG = {
-    "config_version": "2026-11-06-tam",
-    "bins": {"1": "Nhựa", "2": "Giấy", "3": "Kim loại", "4": "Khác"},
+    "config_version": "2026-11-07-draft",
+    # Tên ngăn bằng tiếng Anh không dấu để ESP32 và màn hình hiển thị không lỗi font; UI tự dịch theo số ngăn
+    "bins": {"1": "Plastic", "2": "Paper", "3": "Metal", "4": "Other"},
     "label_to_bin": {
         "plastic_bottle": 1, "plastic_container": 1, "plastic_cutlery": 1,
         "paper": 2,
@@ -37,8 +38,8 @@ WARM_START_HOUR, WARM_END_HOUR = 7, 22
 TIMEZONE = "Asia/Ho_Chi_Minh"
 
 # Hai tính năng cần khoá bí mật do chủ tự tạo trong Modal Secret. Bật lên sau khi đã tạo:
-#   phan-loai-auth : BIN_TOKEN               -> /detect và /config đòi header X-Bin-Token
-#   phan-loai-r2   : R2_ENDPOINT, R2_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   smart-bin-auth : BIN_TOKEN               -> /detect và /config đòi header X-Bin-Token
+#   smart-bin-r2   : R2_ENDPOINT, R2_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 REQUIRE_TOKEN = True
 STORE_SAMPLES = False
 SAMPLE_PREFIX = "samples"  # ảnh lưu ở R2: samples/YYYY-MM-DD/<request_id>.jpg + .json
@@ -47,9 +48,9 @@ image = modal.Image.debian_slim(python_version="3.12").pip_install(
     "onnxruntime", "pillow", "numpy", "fastapi[standard]"
 )
 app = modal.App(APP_NAME, image=image)
-vol = modal.Volume.from_name("phan-loai-models", create_if_missing=True)
-auth_secrets = [modal.Secret.from_name("phan-loai-auth")] if REQUIRE_TOKEN else []
-r2_secrets = [modal.Secret.from_name("phan-loai-r2")] if STORE_SAMPLES else []
+vol = modal.Volume.from_name("smart-bin-models", create_if_missing=True)
+auth_secrets = [modal.Secret.from_name("smart-bin-auth")] if REQUIRE_TOKEN else []
+r2_secrets = [modal.Secret.from_name("smart-bin-r2")] if STORE_SAMPLES else []
 
 # Chỉ import trong container; máy local không cần cài các thư viện này
 with image.imports():
@@ -135,11 +136,11 @@ class Detector:
     def check_token(self, request: Request) -> None:
         # Chưa tạo Secret thì self.token rỗng: bỏ qua kiểm tra (giai đoạn thử)
         if self.token and not hmac.compare_digest(request.headers.get("x-bin-token", ""), self.token):
-            raise HTTPException(401, "Thiếu hoặc sai X-Bin-Token")
+            raise HTTPException(401, "Missing or invalid X-Bin-Token")
 
     @modal.asgi_app(label=APP_NAME)
     def api(self):
-        web = FastAPI(title="phan-loai", docs_url=None, redoc_url=None)
+        web = FastAPI(title=APP_NAME, docs_url=None, redoc_url=None)
         # Trang demo chạy trên trình duyệt gọi từ domain khác nên cần CORS
         web.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"],
                            allow_headers=["Content-Type", "X-Bin-Token", "X-Device-Id"])
@@ -160,11 +161,11 @@ class Detector:
             body = await request.body()
             t_recv = time.perf_counter()  # nhận xong ảnh qua mạng
             if not body or len(body) > MAX_BYTES:
-                raise HTTPException(400, "Ảnh rỗng hoặc quá lớn")
+                raise HTTPException(400, "Image is empty or too large")
             try:
                 img = Image.open(io.BytesIO(body)).convert("RGB")
             except Exception:
-                raise HTTPException(400, "Không đọc được ảnh JPEG")
+                raise HTTPException(400, "Cannot decode JPEG image")
             t1 = time.perf_counter()
             # Chạy model trong thread riêng để không chặn các request khác đang chờ
             objects = await asyncio.to_thread(self.infer, img)
@@ -173,7 +174,7 @@ class Detector:
             request_id = uuid.uuid4().hex[:12]
             infer_ms = round((t2 - t1) * 1000, 1)
             top = objects[0] if objects else {"label": None, "conf": 0.0}
-            # Trace log: 1 dòng JSON mỗi request, xem bằng `modal app logs phan-loai`
+            # Trace log: 1 dòng JSON mỗi request, xem bằng `modal app logs smart-bin-api`
             trace = {
                 "event": "detect", "request_id": request_id, "model": MODEL_VERSION,
                 "device": request.headers.get("x-device-id", ""), "bytes": len(body),

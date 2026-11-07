@@ -11,7 +11,7 @@ image = (
     .pip_install("ultralytics", "onnx", "onnxslim", "onnxruntime")
 )
 app = modal.App("export-yolo26n", image=image)
-vol = modal.Volume.from_name("phan-loai-models", create_if_missing=True)
+vol = modal.Volume.from_name("smart-bin-models", create_if_missing=True)
 
 
 @app.function(volumes={"/models": vol}, timeout=600, cpu=2.0, memory=4096)

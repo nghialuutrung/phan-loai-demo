@@ -22,7 +22,7 @@ from collections import Counter
 from pathlib import Path
 from urllib.parse import urlparse
 
-DEFAULT_URL = "https://toxingau1000--phan-loai.us-east.modal.run"
+DEFAULT_URL = "https://toxingau1000--smart-bin-api.us-east.modal.run"
 THRESHOLDS = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
 IMAGE_EXT = {".jpg", ".jpeg", ".png"}
 
