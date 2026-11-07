@@ -99,7 +99,9 @@
       <ul class="objects" id="list"></ul>
       <label class="field" for="api">API endpoint</label>
       <input type="text" id="api" spellcheck="false"
-             value="https://toxingau1000--phan-loai-detector-detect.us-east.modal.run">
+             value="https://toxingau1000--phan-loai.us-east.modal.run/detect">
+      <label class="field" for="token">Token (để trống nếu server chưa bật)</label>
+      <input type="password" id="token" spellcheck="false" autocomplete="off">
       <p class="muted">Lần gọi đầu sau khi máy chủ nghỉ có thể mất 5–10 giây để khởi động.</p>
     </aside>
   </div>
@@ -190,9 +192,13 @@ async function detect(blob) {
   const started = performance.now();
   setStatus(`Đang gửi ${(blob.size / 1024).toFixed(0)} KB…`);
   try {
+    // Token do người dùng tự nhập, không ghi cứng trong code để ai mở trang cũng không đọc được
+    const headers = { "Content-Type": "image/jpeg" };
+    const token = $("token").value.trim();
+    if (token) headers["X-Bin-Token"] = token;
     const res = await fetch($("api").value.trim(), {
       method: "POST",
-      headers: { "Content-Type": "image/jpeg" },
+      headers,
       body: blob,
       signal: controller.signal,
     });
@@ -200,7 +206,8 @@ async function detect(blob) {
     if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
     lastObjects = data.objects || [];
     draw();
-    setStatus(`Xong sau ${((performance.now() - started) / 1000).toFixed(1)} giây`, "ok");
+    const model = data.model ? ` · model ${data.model}` : "";
+    setStatus(`Xong sau ${((performance.now() - started) / 1000).toFixed(1)} giây${model}`, "ok");
   } catch (err) {
     lastObjects = [];
     draw();
